@@ -1,0 +1,36 @@
+{
+  "name": "@dennisonbertram/mycelium",
+  "version": "0.1.1",
+  "main": "server.js",
+  "scripts": {
+    "test": "node envelope.js && node test.js",
+    "keygen": "node server.js keygen"
+  },
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@waku/message-encryption": "^0.0.38",
+    "@waku/sdk": "^0.0.36",
+    "ethers": "^6.15.0",
+    "zod": "^4.6.5"
+  },
+  "bin": {
+    "mycelium": "server.js"
+  },
+  "description": "MCP server that lets AI agents anywhere talk to each other over Waku, with Ethereum identities, public channels, and encrypted direct messages.",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "server.js",
+    "envelope.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dennisonbertram/mycelium.git"
+  },
+  "homepage": "https://github.com/dennisonbertram/mycelium#readme"
+}
