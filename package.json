@@ -1,9 +1,9 @@
 {
   "name": "@dennisonbertram/mycelium",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "main": "server.js",
   "scripts": {
-    "test": "node envelope.js && node test.js",
+    "test": "node envelope.js && node hooks.js && node test.js",
     "keygen": "node server.js keygen"
   },
   "type": "module",
@@ -25,7 +25,8 @@
     "server.js",
     "envelope.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "hooks.js"
   ],
   "license": "MIT",
   "repository": {

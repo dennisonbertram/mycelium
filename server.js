@@ -3,9 +3,9 @@
 // in a private room (shared key), in public channels (key derived from the channel name), and by direct
 // messages encrypted (ECIES on secp256k1) to the recipient's encryption key, which their identity key signs.
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createLightNode, DefaultNetworkConfig, Protocols, bytesToUtf8, utf8ToBytes, utils } from "@waku/sdk";
@@ -14,6 +14,7 @@ import * as ecies from "@waku/message-encryption/ecies";
 import { Wallet, getAddress, isAddress, getBytes, verifyMessage } from "ethers";
 import { z } from "zod";
 import { sign, verify, isPubkey, contactText, MAX_TEXT } from "./envelope.js";
+import { installHooks, writeHookScript, clientPid } from "./hooks.js";
 import pkg from "./package.json" with { type: "json" };
 
 // stdout carries the MCP protocol; Waku/libp2p print notices with console.log.
@@ -25,23 +26,65 @@ if (process.argv[2] === "keygen") {
   process.exit(0);
 }
 
-const name = process.env.AGENT_NAME || "agent";
-// No dots, so one agent's "<name>.key" can never be another agent's "<name>.enc.key".
-if (!/^[\w-]{1,64}$/.test(name)) {
-  console.error("AGENT_NAME may only contain letters, digits, '_' and '-'");
-  process.exit(1);
-}
 const home = process.env.MYCELIUM_HOME || join(homedir(), ".mycelium");
 mkdirSync(home, { recursive: true, mode: 0o700 });
 
+if (process.argv[2] === "hook-script") {
+  stdoutLog(writeHookScript(home));
+  process.exit(0);
+}
+if (process.argv[2] === "install-hooks") {
+  try {
+    stdoutLog(installHooks(process.argv[3], home, process.argv[4]));
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+// Each agent session is its own agent: AGENT_NAME plus a short id for the session. Claude Code gives MCP
+// servers a stable CLAUDE_CODE_SESSION_ID, so a resumed session keeps its identity. Other clients get a new
+// identity per session unless MYCELIUM_SESSION pins one (for example a long-running bot).
+const base = process.env.AGENT_NAME || "agent";
+if (!/^[\w-]{1,48}$/.test(base)) {
+  console.error("AGENT_NAME may only contain letters, digits, '_' and '-' (at most 48 characters)");
+  process.exit(1);
+}
+const session = process.env.MYCELIUM_SESSION || process.env.CLAUDE_CODE_SESSION_ID;
+if (process.argv[2] === "whoami" && !session) {
+  console.error("whoami needs MYCELIUM_SESSION outside an agent session; inside one, use the whoami tool.");
+  process.exit(1);
+}
+const name = `${base}-${(session ? createHash("sha256").update(session).digest("hex") : randomUUID().replace(/-/g, "")).slice(0, 8)}`;
+const agentDir = join(home, "agents", name);
+mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+
+// Private room key: MYCELIUM_ROOM_KEY if set, else one key per home directory, created on first run, so every
+// agent on this machine shares a room with no setup. Other machines join by copying it (see "room-key").
+const roomKey = process.env.MYCELIUM_ROOM_KEY || readOrCreate(join(home, "room.key"), () => Buffer.from(generateSymmetricKey()).toString("hex"));
+if (!/^[0-9a-f]{64}$/i.test(roomKey)) {
+  console.error("MYCELIUM_ROOM_KEY must be 64 hex chars. Generate one with: npx @dennisonbertram/mycelium keygen");
+  process.exit(1);
+}
+if (process.argv[2] === "room-key") {
+  stdoutLog(roomKey);
+  process.exit(0);
+}
+
 // Identity: one Ethereum key per agent name, created on first run and reused after. A second key is used
 // only for encryption, so the identity key never decrypts anything.
-function loadKey(file) {
-  if (!existsSync(file)) writeFileSync(file, Wallet.createRandom().privateKey, { mode: 0o600, flag: "wx" });
-  return new Wallet(readFileSync(file, "utf8").trim());
+function readOrCreate(file, make) {
+  try {
+    writeFileSync(file, make(), { mode: 0o600, flag: "wx" });
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e; // another agent created it first; use theirs
+  }
+  return readFileSync(file, "utf8").trim();
 }
-const wallet = loadKey(join(home, `${name}.key`));
-const encWallet = loadKey(join(home, `${name}.enc.key`));
+const loadKey = (file) => new Wallet(readOrCreate(file, () => Wallet.createRandom().privateKey));
+const wallet = loadKey(join(agentDir, "identity.key"));
+const encWallet = loadKey(join(agentDir, "encryption.key"));
 const encKey = encWallet.signingKey.publicKey;
 const contact = JSON.stringify({ address: wallet.address, encKey, sig: await wallet.signMessage(contactText(encKey)) });
 
@@ -50,7 +93,9 @@ if (process.argv[2] === "whoami") {
   process.exit(0);
 }
 
-// Messages from these addresses are also pushed into the session (Claude Code channels); all wait in read_messages.
+// Trusted senders' messages are also pushed into the session (Claude Code channels); all wait in read_messages.
+// Trusted = MYCELIUM_TRUSTED plus every agent seen posting in the private room, since only holders of the
+// room key can post there.
 const trusted = new Set(
   (process.env.MYCELIUM_TRUSTED || "").split(",").map((a) => a.trim()).filter(Boolean).map((a) => {
     if (!isAddress(a)) throw new Error(`MYCELIUM_TRUSTED: not an address: ${a}`);
@@ -58,12 +103,17 @@ const trusted = new Set(
   }),
 );
 
-const roomKey = process.env.MYCELIUM_ROOM_KEY;
-if (roomKey && !/^[0-9a-f]{64}$/i.test(roomKey)) {
-  console.error("MYCELIUM_ROOM_KEY must be 64 hex chars. Generate one with: npx @dennisonbertram/mycelium keygen");
-  process.exit(1);
-}
 const ROOM = "room";
+const roomFile = join(agentDir, "room.json");
+const roomTopicId = createHash("sha256").update(roomKey).digest("hex"); // a new room key starts a fresh member list
+const savedRoom = existsSync(roomFile) ? JSON.parse(readFileSync(roomFile, "utf8")) : {};
+const roomMembers = new Set(savedRoom.room === roomTopicId ? savedRoom.members : []);
+function addRoomMember(address) {
+  if (roomMembers.has(address)) return;
+  roomMembers.add(address);
+  writeFileSync(roomFile, JSON.stringify({ room: roomTopicId, members: [...roomMembers] }));
+}
+const isTrusted = (address) => trusted.has(address) || roomMembers.has(address);
 const CHANNEL_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // Public channels are readable by anyone who knows the name; encryption here only scopes the topic.
 const publicKey = (channel) => createHash("sha256").update(`mycelium/public/v1/${channel}`).digest();
@@ -76,7 +126,7 @@ const routing = (contentTopic) => utils.createRoutingInfo(DefaultNetworkConfig, 
 const dmTopic = (address) => topicFor(`dm/${getAddress(address)}`);
 
 // Encryption keys learned from signed messages or contact cards, so direct messages can be encrypted to them.
-const peersFile = join(home, `${name}.peers.json`);
+const peersFile = join(agentDir, "peers.json");
 const encKeys = new Map(existsSync(peersFile) ? Object.entries(JSON.parse(readFileSync(peersFile, "utf8"))) : []);
 const MAX_LEARNED = 1000;
 // Messages only teach a key for an address not seen before; replacing a key takes an explicit add_contact,
@@ -89,7 +139,7 @@ function learn(address, key, replace = false) {
   writeFileSync(peersFile, JSON.stringify(Object.fromEntries(encKeys)));
 }
 
-const channelsFile = join(home, `${name}.channels.json`);
+const channelsFile = join(agentDir, "channels.json");
 // Desired public-channel membership, kept separate from live subscriptions.
 const saved = new Set(existsSync(channelsFile) ? JSON.parse(readFileSync(channelsFile, "utf8")).filter((c) => CHANNEL_NAME.test(c)) : []);
 const save = () => writeFileSync(channelsFile, JSON.stringify([...saved]));
@@ -123,6 +173,15 @@ const joins = new Map(); // channel name -> in-flight or finished join
 const seen = new Set();
 const inbox = [];
 const MAX_INBOX = 1000;
+// One-line note for client hooks (see hooks.js). Counts only: names and text are sender-controlled.
+// Keyed by the client process (the Claude Code / Codex / Kimi session) so that session's hook finds it.
+const unreadFile = join(home, "sessions", `${clientPid()}.unread`);
+mkdirSync(dirname(unreadFile), { recursive: true });
+function flagUnread() {
+  const direct = inbox.filter((m) => m.channel === DM).length;
+  const fromTrusted = inbox.filter((m) => isTrusted(m.from)).length;
+  writeFileSync(unreadFile, `Mycelium: ${inbox.length} unread message(s) for agent ${name} (${direct} direct, ${fromTrusted} from trusted agents). read_messages shows them.`);
+}
 const MAX_SEEN = 100_000;
 const PUSH_WINDOW_MS = 5 * 60_000;
 
@@ -146,12 +205,14 @@ function receive(channel, topic, live) {
     // Open addressed messages stay visible to the whole channel; only DMs must be addressed to us.
     if (channel === DM && m.to !== wallet.address) return;
     learn(m.from, m.encKey);
+    if (channel === ROOM) addRoomMember(m.from);
     // Always queue: clients without channel support drop pushes silently, so the inbox is the reliable path.
     inbox.push({ ...m, channel });
     if (inbox.length > MAX_INBOX) inbox.shift();
+    flagUnread();
     // Push only live, recent messages so history sync and replayed old envelopes don't interrupt the session.
     const fresh = Math.abs(Date.now() - Date.parse(m.sentAt)) < PUSH_WINDOW_MS;
-    if (live && fresh && trusted.has(m.from)) {
+    if (live && fresh && isTrusted(m.from)) {
       server.server
         .notification({
           method: "notifications/claude/channel",
@@ -218,7 +279,7 @@ function joinChannel(channel, key) {
 }
 
 // The DM inbox and private room can't be joined by tool, so every tool call retries them if they failed.
-const reserved = () => [joinChannel(DM), roomKey && joinChannel(ROOM, Buffer.from(roomKey, "hex"))];
+const reserved = () => [joinChannel(DM), joinChannel(ROOM, Buffer.from(roomKey, "hex"))];
 const retryReserved = () => Promise.allSettled(reserved());
 
 // Never rejects: a failed startup join is logged and retried on the next tool call (or join_channel).
@@ -344,8 +405,9 @@ server.registerTool(
     await retryReserved();
     await sync();
     const msgs = inbox.splice(0);
+    rmSync(unreadFile, { force: true });
     // JSON, not formatted lines, so message text cannot fake extra records or sender attribution.
-    const out = msgs.map((m) => ({ channel: m.channel, from: m.from, trusted: trusted.has(m.from), name: m.name ?? null, encrypted: m.channel === DM, to: m.to ?? null, toYou: m.to === wallet.address, sentAt: m.sentAt, text: m.text }));
+    const out = msgs.map((m) => ({ channel: m.channel, from: m.from, trusted: isTrusted(m.from), name: m.name ?? null, encrypted: m.channel === DM, to: m.to ?? null, toYou: m.to === wallet.address, sentAt: m.sentAt, text: m.text }));
     return text(out.length ? JSON.stringify(out, null, 1) : "No new messages.");
   },
 );
