@@ -3,7 +3,7 @@
 // sender's separate encryption public key; signing it binds it to the address so others can encrypt to them.
 import { verifyMessage, getAddress, isAddress, SigningKey } from "ethers";
 
-const FIELDS = ["v", "id", "topic", "channel", "from", "encKey", "name", "to", "text", "sentAt"];
+const FIELDS = ["v", "id", "topic", "channel", "from", "encKey", "name", "to", "kind", "text", "sentAt"];
 // Fixed field order so signer and verifier hash identical bytes. The Waku topic is signed so a message
 // cannot be replayed into a different channel or private room (topics derive from the channel key).
 const canonical = (m) => JSON.stringify(FIELDS.map((f) => m[f] ?? null));
@@ -32,6 +32,7 @@ export function verify(m, topic) {
     if (m?.v !== 1 || m.topic !== topic || !str(m.id, 128) || !str(m.channel, 64) || !str(m.text, MAX_TEXT)) return null;
     if (!str(m.sentAt, 64) || !(m.name == null || str(m.name, 64)) || !(m.to == null || (str(m.to, 42) && isAddress(m.to)))) return null;
     if (!(m.encKey == null || isPubkey(m.encKey))) return null;
+    if (!(m.kind == null || m.kind === "status")) return null; // "status": what the sender is working on
     if (!str(m.sig, 200) || !isAddress(m.from) || verifyMessage(canonical(m), m.sig) !== getAddress(m.from)) return null;
     return { ...m, from: getAddress(m.from), to: m.to && getAddress(m.to) };
   } catch {
@@ -48,6 +49,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const m = await sign(alice, { id: "1", topic: "t1", channel: "room", encKey: enc, name: "alice", text: "hi", sentAt: "t" });
   assert.equal(verify(m, "t1").encKey, enc);
   assert.ok(!verify({ ...m, encKey: mallory.signingKey.publicKey }, "t1"), "swapped encryption key");
+  assert.ok(!verify({ ...m, kind: "status" }, "t1"), "kind is signed");
   assert.ok(!verify(m, "t2"), "replay into another room with the same label");
   assert.ok(!verify({ ...m, text: "pay mallory" }, "t1"), "tampered text");
   assert.ok(!verify({ ...m, to: mallory.address }, "t1"), "tampered recipient");

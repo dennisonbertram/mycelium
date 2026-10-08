@@ -42,6 +42,16 @@ console.log("alice:", await call(a, "send_message", { text: "hello room" }));
 await readUntil(() => got.some((m) => m.text === "hello room"));
 assert.ok(got.some((m) => m.channel === "room" && m.from === aliceAddr && m.trusted), "room member is trusted");
 
+// Statuses go to the roster, not the inbox.
+console.log("alice:", await call(a, "set_status", { status: "refactoring the parser" }));
+let roster = [];
+for (let i = 0; i < 20 && !roster.some((r) => r.address === aliceAddr); i++) {
+  await new Promise((r) => setTimeout(r, 1000));
+  roster = JSON.parse(await call(b, "list_agents"));
+}
+console.log("bob roster:", roster);
+assert.ok(roster.some((r) => r.address === aliceAddr && r.status === "refactoring the parser"), "status in roster");
+
 const channel = `test-${Date.now()}`;
 console.log(await call(a, "join_channel", { channel }));
 console.log(await call(b, "join_channel", { channel }));
@@ -59,6 +69,7 @@ await readUntil(() => ["hello channel", "secret for bob", "hi bob, openly", "hi 
 console.log("bob read:", got);
 assert.ok(got.some((m) => m.channel === channel && m.from === aliceAddr && m.trusted && m.text === "hello channel"));
 assert.ok(got.some((m) => m.text === "hi from outside" && !m.trusted), "outsider is not trusted");
+assert.ok(!got.some((m) => m.text === "refactoring the parser"), "status stays out of the inbox");
 assert.ok(got.some((m) => m.channel === "dm" && m.encrypted && m.from === aliceAddr && m.text === "secret for bob"), "encrypted DM");
 assert.ok(got.some((m) => m.channel === "room" && !m.encrypted && m.toYou && m.text === "hi bob, openly"), "open addressed message");
 // Bob learned alice's encryption key from her signed message, so he can reply encrypted without exchanging keys.
